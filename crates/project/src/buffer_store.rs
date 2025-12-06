@@ -18,7 +18,7 @@ use language::{
     },
 };
 use rpc::{
-    AnyProtoClient, ErrorCode, ErrorExt as _, TypedEnvelope,
+    AnyProtoClient, ErrorCode, ErrorCodeExt as _, ErrorExt as _, TypedEnvelope,
     proto::{self},
 };
 
@@ -126,6 +126,7 @@ impl RemoteBufferStore {
         &self,
         buffer_handle: Entity<Buffer>,
         new_path: Option<proto::ProjectPath>,
+        with_sudo: bool,
         cx: &Context<BufferStore>,
     ) -> Task<Result<()>> {
         let buffer = buffer_handle.read(cx);
@@ -140,6 +141,7 @@ impl RemoteBufferStore {
                     buffer_id,
                     new_path,
                     version: serialize_version(&version),
+                    with_sudo,
                 })
                 .await?;
             let version = deserialize_version(&response.version);
@@ -370,6 +372,7 @@ impl LocalBufferStore {
         worktree: Entity<Worktree>,
         path: Arc<RelPath>,
         mut has_changed_file: bool,
+        with_sudo: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<()>> {
         let buffer = buffer_handle.read(cx);
@@ -387,7 +390,11 @@ impl LocalBufferStore {
         }
 
         let save = worktree.update(cx, |worktree, cx| {
-            worktree.write_file(path, text, line_ending, cx)
+            if with_sudo {
+                worktree.write_file_with_sudo(path, text, line_ending, cx)
+            } else {
+                worktree.write_file(path, text, line_ending, cx)
+            }
         });
 
         cx.spawn(async move |this, cx| {
@@ -583,16 +590,17 @@ impl LocalBufferStore {
         None
     }
 
-    fn save_buffer(
+    fn save_buffer_internal(
         &self,
         buffer: Entity<Buffer>,
+        with_sudo: bool,
         cx: &mut Context<BufferStore>,
     ) -> Task<Result<()>> {
         let Some(file) = File::from_dyn(buffer.read(cx).file()) else {
             return Task::ready(Err(anyhow!("buffer doesn't have a file")));
         };
         let worktree = file.worktree.clone();
-        self.save_local_buffer(buffer, worktree, file.path.clone(), false, cx)
+        self.save_local_buffer(buffer, worktree, file.path.clone(), false, with_sudo, cx)
     }
 
     fn save_buffer_as(
@@ -608,7 +616,7 @@ impl LocalBufferStore {
         else {
             return Task::ready(Err(anyhow!("no such worktree")));
         };
-        self.save_local_buffer(buffer, worktree, path.path, true, cx)
+        self.save_local_buffer(buffer, worktree, path.path, true, false, cx)
     }
 
     fn open_buffer(
@@ -882,9 +890,26 @@ impl BufferStore {
         buffer: Entity<Buffer>,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        self.save_buffer_internal(buffer, false, cx)
+    }
+
+    pub fn save_buffer_with_sudo(
+        &mut self,
+        buffer: Entity<Buffer>,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        self.save_buffer_internal(buffer, true, cx)
+    }
+
+    fn save_buffer_internal(
+        &mut self,
+        buffer: Entity<Buffer>,
+        with_sudo: bool,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
         match &mut self.state {
-            BufferStoreState::Local(this) => this.save_buffer(buffer, cx),
-            BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, cx),
+            BufferStoreState::Local(this) => this.save_buffer_internal(buffer, with_sudo, cx),
+            BufferStoreState::Remote(this) => this.save_remote_buffer(buffer, None, with_sudo, cx),
         }
     }
 
@@ -898,7 +923,7 @@ impl BufferStore {
         let task = match &self.state {
             BufferStoreState::Local(this) => this.save_buffer_as(buffer.clone(), path, cx),
             BufferStoreState::Remote(this) => {
-                this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), cx)
+                this.save_remote_buffer(buffer.clone(), Some(path.to_proto()), false, cx)
             }
         };
         cx.spawn(async move |this, cx| {
@@ -1339,6 +1364,7 @@ impl BufferStore {
         mut cx: AsyncApp,
     ) -> Result<proto::BufferSaved> {
         let buffer_id = BufferId::new(envelope.payload.buffer_id)?;
+        let with_sudo = envelope.payload.with_sudo;
         let (buffer, project_id) = this.read_with(&cx, |this, _| {
             anyhow::Ok((
                 this.get_existing(buffer_id)?,
@@ -1355,17 +1381,31 @@ impl BufferStore {
             .await?;
         let buffer_id = buffer.read_with(&cx, |buffer, _| buffer.remote_id())?;
 
-        if let Some(new_path) = envelope.payload.new_path
+        let save_result = if let Some(new_path) = envelope.payload.new_path
             && let Some(new_path) = ProjectPath::from_proto(new_path)
         {
             this.update(&mut cx, |this, cx| {
                 this.save_buffer_as(buffer.clone(), new_path, cx)
             })?
-            .await?;
+            .await
+        } else if with_sudo {
+            this.update(&mut cx, |this, cx| {
+                this.save_buffer_with_sudo(buffer.clone(), cx)
+            })?
+            .await
         } else {
             this.update(&mut cx, |this, cx| this.save_buffer(buffer.clone(), cx))?
-                .await?;
+                .await
+        };
+
+        if let Err(err) = &save_result {
+            if Self::is_permission_error(err) {
+                return Err(ErrorCode::PermissionDenied
+                    .message(format!("Permission denied: {}", err))
+                    .into());
+            }
         }
+        save_result?;
 
         buffer.read_with(&cx, |buffer, _| proto::BufferSaved {
             project_id,
@@ -1373,6 +1413,17 @@ impl BufferStore {
             version: serialize_version(buffer.saved_version()),
             mtime: buffer.saved_mtime().map(|time| time.into()),
         })
+    }
+
+    fn is_permission_error(err: &anyhow::Error) -> bool {
+        for cause in err.chain() {
+            if let Some(io_err) = cause.downcast_ref::<io::Error>() {
+                if io_err.kind() == io::ErrorKind::PermissionDenied {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     pub async fn handle_close_buffer(

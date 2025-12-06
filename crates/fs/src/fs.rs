@@ -123,6 +123,7 @@ pub trait Fs: Send + Sync {
     async fn load_bytes(&self, path: &Path) -> Result<Vec<u8>>;
     async fn atomic_write(&self, path: PathBuf, text: String) -> Result<()>;
     async fn save(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()>;
+    async fn save_with_sudo(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()>;
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()>;
     async fn canonicalize(&self, path: &Path) -> Result<PathBuf>;
     async fn is_file(&self, path: &Path) -> bool;
@@ -807,6 +808,39 @@ impl Fs for RealFs {
             writer.write_all(chunk.as_bytes()).await?;
         }
         writer.flush().await?;
+        Ok(())
+    }
+
+    async fn save_with_sudo(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
+        use smol::io::AsyncWriteExt as _;
+        use smol::process::{Command, Stdio};
+
+        let path_str = path
+            .to_str()
+            .context("path contains invalid UTF-8")?
+            .to_owned();
+
+        let mut child = Command::new("sudo")
+            .args(["--non-interactive", "tee", &path_str])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to spawn sudo tee")?;
+
+        let mut stdin = child.stdin.take().context("failed to get stdin")?;
+        for chunk in chunks(text, line_ending) {
+            stdin.write_all(chunk.as_bytes()).await?;
+        }
+        stdin.flush().await?;
+        drop(stdin);
+
+        let output = child.output().await?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            anyhow::bail!("sudo tee failed: {}", stderr.trim());
+        }
+
         Ok(())
     }
 
@@ -2561,6 +2595,10 @@ impl Fs for FakeFs {
         }
         self.write_file_internal(path, content.into_bytes(), false)?;
         Ok(())
+    }
+
+    async fn save_with_sudo(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
+        self.save(path, text, line_ending).await
     }
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {
