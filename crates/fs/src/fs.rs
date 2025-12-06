@@ -811,17 +811,16 @@ impl Fs for RealFs {
         Ok(())
     }
 
+    #[cfg(unix)]
     async fn save_with_sudo(&self, path: &Path, text: &Rope, line_ending: LineEnding) -> Result<()> {
         use smol::io::AsyncWriteExt as _;
         use smol::process::{Command, Stdio};
 
-        let path_str = path
-            .to_str()
-            .context("path contains invalid UTF-8")?
-            .to_owned();
-
         let mut child = Command::new("sudo")
-            .args(["--non-interactive", "tee", &path_str])
+            .arg("--non-interactive")
+            .arg("tee")
+            .arg("--")
+            .arg(path.as_os_str())
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -838,10 +837,25 @@ impl Fs for RealFs {
         let output = child.output().await?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("sudo tee failed: {}", stderr.trim());
+            let stderr_truncated: String = stderr.chars().take(500).collect();
+            let exit_info = output
+                .status
+                .code()
+                .map(|c| format!("exit code {}", c))
+                .unwrap_or_else(|| "killed by signal".to_string());
+            anyhow::bail!(
+                "sudo tee failed ({}): {}",
+                exit_info,
+                stderr_truncated.trim()
+            );
         }
 
         Ok(())
+    }
+
+    #[cfg(not(unix))]
+    async fn save_with_sudo(&self, _path: &Path, _text: &Rope, _line_ending: LineEnding) -> Result<()> {
+        anyhow::bail!("sudo escalation is not supported on this platform")
     }
 
     async fn write(&self, path: &Path, content: &[u8]) -> Result<()> {

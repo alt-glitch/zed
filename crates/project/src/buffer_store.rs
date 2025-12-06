@@ -1416,6 +1416,18 @@ impl BufferStore {
     }
 
     fn is_permission_error(err: &anyhow::Error) -> bool {
+        let err_string = format!("{:#}", err).to_lowercase();
+
+        // Check for sudo authentication failures
+        if err_string.contains("a password is required")
+            || err_string.contains("authentication is required")
+            || err_string.contains("permission denied")
+            || err_string.contains("operation not permitted")
+        {
+            return true;
+        }
+
+        // Check for io::Error with PermissionDenied kind
         for cause in err.chain() {
             if let Some(io_err) = cause.downcast_ref::<io::Error>() {
                 if io_err.kind() == io::ErrorKind::PermissionDenied {
