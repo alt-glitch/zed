@@ -731,8 +731,29 @@ impl Worktree {
         line_ending: LineEnding,
         cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
+        self.write_file_internal(path, text, line_ending, false, cx)
+    }
+
+    pub fn write_file_with_sudo(
+        &self,
+        path: Arc<RelPath>,
+        text: Rope,
+        line_ending: LineEnding,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<Arc<File>>> {
+        self.write_file_internal(path, text, line_ending, true, cx)
+    }
+
+    fn write_file_internal(
+        &self,
+        path: Arc<RelPath>,
+        text: Rope,
+        line_ending: LineEnding,
+        with_sudo: bool,
+        cx: &Context<Worktree>,
+    ) -> Task<Result<Arc<File>>> {
         match self {
-            Worktree::Local(this) => this.write_file(path, text, line_ending, cx),
+            Worktree::Local(this) => this.write_file_internal(path, text, line_ending, with_sudo, cx),
             Worktree::Remote(_) => {
                 Task::ready(Err(anyhow!("remote worktree can't yet write files")))
             }
@@ -1439,11 +1460,12 @@ impl LocalWorktree {
         })
     }
 
-    fn write_file(
+    fn write_file_internal(
         &self,
         path: Arc<RelPath>,
         text: Rope,
         line_ending: LineEnding,
+        with_sudo: bool,
         cx: &Context<Worktree>,
     ) -> Task<Result<Arc<File>>> {
         let fs = self.fs.clone();
@@ -1453,7 +1475,13 @@ impl LocalWorktree {
         let write = cx.background_spawn({
             let fs = fs.clone();
             let abs_path = abs_path.clone();
-            async move { fs.save(&abs_path, &text, line_ending).await }
+            async move {
+                if with_sudo {
+                    fs.save_with_sudo(&abs_path, &text, line_ending).await
+                } else {
+                    fs.save(&abs_path, &text, line_ending).await
+                }
+            }
         });
 
         cx.spawn(async move |this, cx| {
